@@ -3,6 +3,7 @@ package mdns
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"sync"
@@ -11,16 +12,148 @@ import (
 	"github.com/pion/logging"
 	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
+
+type SocketConn interface {
+	Close() error
+	WriteTo(b []byte) (n int, err error)
+	ReadFrom(b []byte) (n int, src net.Addr, err error)
+	GenerateDnsResourceBody(ip net.IP) dnsmessage.ResourceBody
+}
+
+type SocketConn4 struct {
+	socket        *ipv4.PacketConn
+	broadcastAddr *net.UDPAddr
+}
+
+func NewSocketConn4(conn *ipv4.PacketConn) (conn4 *SocketConn4, err error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+
+	joinErrCount := 0
+	ipa := net.ParseIP(broadcastAddress4)
+	for i := range ifaces {
+		if err = conn.JoinGroup(&ifaces[i], &net.UDPAddr{IP: ipa}); err != nil {
+			joinErrCount++
+		}
+	}
+
+	if joinErrCount >= len(ifaces) {
+		return nil, errJoiningMulticastGroup
+	}
+
+	broadcastAddr, err := net.ResolveUDPAddr("udp", broadcastAddress4+":"+broadcastPort)
+	if err != nil {
+		return nil, err
+	}
+
+	conn4 = &SocketConn4{
+		socket:        conn,
+		broadcastAddr: broadcastAddr,
+	}
+	return conn4, nil
+}
+
+func (conn4 *SocketConn4) GenerateDnsResourceBody(ip net.IP) dnsmessage.ResourceBody {
+	rawIP := ip.To4()
+	if rawIP == nil {
+		return nil
+	}
+
+	ipInt := big.NewInt(0)
+	ipInt.SetBytes(rawIP)
+	var out [4]byte
+	copy(out[:], ipInt.Bytes())
+
+	return &dnsmessage.AResource{
+		A: out,
+	}
+}
+
+func (conn4 *SocketConn4) WriteTo(b []byte) (n int, err error) {
+	return conn4.socket.WriteTo(b, nil, conn4.broadcastAddr)
+}
+
+func (conn4 *SocketConn4) ReadFrom(b []byte) (n int, src net.Addr, err error) {
+	n, _, src, err = conn4.socket.ReadFrom(b)
+	return
+}
+
+func (conn4 *SocketConn4) Close() error {
+	return conn4.socket.Close()
+}
+
+type SocketConn6 struct {
+	socket        *ipv6.PacketConn
+	broadcastAddr *net.UDPAddr
+}
+
+func NewSocketConn6(conn *ipv6.PacketConn) (conn6 *SocketConn6, err error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+
+	joinErrCount := 0
+	ipa := net.ParseIP(broadcastAddress6)
+	for i := range ifaces {
+		if err = conn.JoinGroup(&ifaces[i], &net.UDPAddr{IP: ipa}); err != nil {
+			joinErrCount++
+		}
+	}
+
+	if joinErrCount >= len(ifaces) {
+		return nil, errJoiningMulticastGroup
+	}
+
+	broadcastAddr, err := net.ResolveUDPAddr("udp6", "["+broadcastAddress6+"]:"+broadcastPort)
+	if err != nil {
+		return nil, err
+	}
+
+	conn6 = &SocketConn6{
+		socket:        conn,
+		broadcastAddr: broadcastAddr,
+	}
+	return conn6, nil
+}
+
+func (conn6 *SocketConn6) GenerateDnsResourceBody(ip net.IP) (body dnsmessage.ResourceBody) {
+	rawIP := ip.To16()
+	if rawIP == nil {
+		return
+	}
+
+	var out [16]byte
+	ipInt := big.NewInt(0)
+	ipInt.SetBytes(rawIP)
+	copy(out[:], ipInt.Bytes())
+	return &dnsmessage.AAAAResource{
+		AAAA: out,
+	}
+}
+
+func (conn6 *SocketConn6) WriteTo(b []byte) (n int, err error) {
+	return conn6.socket.WriteTo(b, nil, conn6.broadcastAddr)
+}
+
+func (conn6 *SocketConn6) ReadFrom(b []byte) (n int, src net.Addr, err error) {
+	n, _, src, err = conn6.socket.ReadFrom(b)
+	return
+}
+
+func (conn6 *SocketConn6) Close() error {
+	return conn6.socket.Close()
+}
 
 // Conn represents a mDNS Server
 type Conn struct {
-	mu  sync.RWMutex
-	log logging.LeveledLogger
-
-	socket  *ipv4.PacketConn
-	dstAddr *net.UDPAddr
-
+	mu            sync.RWMutex
+	log           logging.LeveledLogger
+	socketConn    SocketConn
 	queryInterval time.Duration
 	localNames    []string
 	queries       []query
@@ -41,35 +174,37 @@ type queryResult struct {
 const (
 	inboundBufferSize    = 512
 	defaultQueryInterval = time.Second
-	destinationAddress   = "224.0.0.251:5353"
+	broadcastAddress4    = "224.0.0.251"
+	broadcastAddress6    = "ff02::fb"
+	broadcastPort        = "5353"
 	maxMessageRecords    = 3
 	responseTTL          = 120
 )
 
 // Server establishes a mDNS connection over an existing conn
 func Server(conn *ipv4.PacketConn, config *Config) (*Conn, error) {
+	socketConn, err := NewSocketConn4(conn)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return doServe(socketConn, config)
+}
+
+func Server6(conn *ipv6.PacketConn, config *Config) (*Conn, error) {
+	socketConn, err := NewSocketConn6(conn)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return doServe(socketConn, config)
+}
+
+func doServe(socketConn SocketConn, config *Config) (*Conn, error) {
 	if config == nil {
 		return nil, errNilConfig
-	}
-
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil, err
-	}
-
-	joinErrCount := 0
-	for i := range ifaces {
-		if err = conn.JoinGroup(&ifaces[i], &net.UDPAddr{IP: net.IPv4(224, 0, 0, 251)}); err != nil {
-			joinErrCount++
-		}
-	}
-	if joinErrCount >= len(ifaces) {
-		return nil, errJoiningMulticastGroup
-	}
-
-	dstAddr, err := net.ResolveUDPAddr("udp", destinationAddress)
-	if err != nil {
-		return nil, err
 	}
 
 	loggerFactory := config.LoggerFactory
@@ -85,8 +220,7 @@ func Server(conn *ipv4.PacketConn, config *Config) (*Conn, error) {
 	c := &Conn{
 		queryInterval: defaultQueryInterval,
 		queries:       []query{},
-		socket:        conn,
-		dstAddr:       dstAddr,
+		socketConn:    socketConn,
 		localNames:    localNames,
 		log:           loggerFactory.NewLogger("mdns"),
 		closed:        make(chan interface{}),
@@ -107,7 +241,7 @@ func (c *Conn) Close() error {
 	default:
 	}
 
-	if err := c.socket.Close(); err != nil {
+	if err := c.socketConn.Close(); err != nil {
 		return err
 	}
 
@@ -149,18 +283,6 @@ func (c *Conn) Query(ctx context.Context, name string) (dnsmessage.ResourceHeade
 	}
 }
 
-func ipToBytes(ip net.IP) (out [4]byte) {
-	rawIP := ip.To4()
-	if rawIP == nil {
-		return
-	}
-
-	ipInt := big.NewInt(0)
-	ipInt.SetBytes(rawIP)
-	copy(out[:], ipInt.Bytes())
-	return
-}
-
 func interfaceForRemote(remote string) (net.IP, error) {
 	conn, err := net.Dial("udp", remote)
 	if err != nil {
@@ -199,7 +321,7 @@ func (c *Conn) sendQuestion(name string) {
 		return
 	}
 
-	if _, err := c.socket.WriteTo(rawQuery, nil, c.dstAddr); err != nil {
+	if _, err := c.socketConn.WriteTo(rawQuery); err != nil {
 		c.log.Warnf("Failed to send mDNS packet %v", err)
 		return
 	}
@@ -225,9 +347,7 @@ func (c *Conn) sendAnswer(name string, dst net.IP) {
 					Name:  packedName,
 					TTL:   responseTTL,
 				},
-				Body: &dnsmessage.AResource{
-					A: ipToBytes(dst),
-				},
+				Body: c.socketConn.GenerateDnsResourceBody(dst),
 			},
 		},
 	}
@@ -238,10 +358,11 @@ func (c *Conn) sendAnswer(name string, dst net.IP) {
 		return
 	}
 
-	if _, err := c.socket.WriteTo(rawAnswer, nil, c.dstAddr); err != nil {
+	if _, err := c.socketConn.WriteTo(rawAnswer); err != nil {
 		c.log.Warnf("Failed to send mDNS packet %v", err)
 		return
 	}
+	fmt.Printf("answer sent: %s", name)
 }
 
 func (c *Conn) start() { //nolint gocognit
@@ -255,7 +376,7 @@ func (c *Conn) start() { //nolint gocognit
 	p := dnsmessage.Parser{}
 
 	for {
-		n, _, src, err := c.socket.ReadFrom(b)
+		n, src, err := c.socketConn.ReadFrom(b)
 		if err != nil {
 			return
 		}

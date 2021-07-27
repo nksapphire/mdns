@@ -10,7 +10,8 @@ const (
 	// DefaultAddress is the default used by mDNS
 	// and in most cases should be the address that the
 	// net.Conn passed to Server is bound to
-	DefaultAddress = "224.0.0.0:5353"
+	DefaultAddress  = "224.0.0.0:5353"
+	DefaultAddress6 = "[ff02::01]:5353"
 )
 
 // Config is used to configure a mDNS client or server.
